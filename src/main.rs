@@ -1,22 +1,30 @@
-use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{fields::fp::Fp, BigInteger, MontBackend};
-use ark_secp256k1::{Affine, Fq, FqConfig, G_GENERATOR_X, G_GENERATOR_Y};
+use ark_ec::{models::short_weierstrass::SWCurveConfig, AffineRepr, CurveGroup};
+use ark_secp256k1::{Affine, Config, Fq};
 use ark_std::One;
 use core::fmt;
 use num_bigint::{BigInt, RandBigInt};
 use rand::thread_rng;
 use std::fmt::{Display, Formatter};
-use tiny_keccak::{Hasher, Keccak};
 
 const N: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
 
 fn main() {
-    let pk = Secret::default();
-    println!("{pk}");
-    let points = pk.derive_pubkey();
-    println!("{points}");
-    println!("{}", EthereumAddress::from(&points));
-    println!("{}", EthereumPrivateKey::from(&pk));
+    let secret1 = Secret::default();
+    let secret2 = Secret::default();
+    let pubkey1 = secret1.derive_pubkey();
+    let pubkey2 = secret2.derive_pubkey();
+    let ss1 = EcDiffieHellman {
+        counterparty_public_key: &pubkey2,
+        secret: &secret1,
+    }
+    .generate_shared_secret();
+    let ss2 = EcDiffieHellman {
+        counterparty_public_key: &pubkey1,
+        secret: &secret2,
+    }
+    .generate_shared_secret();
+    assert_eq!(ss1, ss2);
+    println!("Shared Secret: {:?}", ss1);
 }
 
 impl Secret {
@@ -27,19 +35,13 @@ impl Secret {
     }
 
     pub fn derive_pubkey(&self) -> K1CurvePoint {
-        let x = Fq::from(G_GENERATOR_X);
-        let y = Fq::from(G_GENERATOR_Y);
-        // AFFINE REQUIRES X, Y TO BE ON THE CURVE
-        let g = Affine::new(x, y);
-        let public_key = g.mul_bigint(&self.0.to_u64_digits().1).into_affine();
-        K1CurvePoint {
-            x: public_key.x,
-            y: public_key.y,
-        }
+        K1CurvePoint(
+            Config::GENERATOR
+                .mul_bigint(&self.0.to_u64_digits().1)
+                .into_affine(),
+        )
     }
 }
-pub type PublicKey = K1CurvePoint;
-pub type PrivateKey = Secret;
 
 impl Default for Secret {
     fn default() -> Self {
@@ -60,14 +62,11 @@ pub struct UncompressedPublicKey(pub String);
 
 impl From<&K1CurvePoint> for UncompressedPublicKey {
     fn from(value: &K1CurvePoint) -> Self {
-        UncompressedPublicKey(format!("04{}{}", value.x, value.y))
+        UncompressedPublicKey(format!("04{}{}", value.0.x, value.0.y))
     }
 }
 
-pub struct K1CurvePoint {
-    x: Fp<MontBackend<FqConfig, 4>, 4>,
-    y: Fp<MontBackend<FqConfig, 4>, 4>,
-}
+pub struct K1CurvePoint(Affine);
 
 impl From<Secret> for K1CurvePoint {
     fn from(value: Secret) -> Self {
@@ -77,49 +76,11 @@ impl From<Secret> for K1CurvePoint {
 
 impl Display for K1CurvePoint {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Public Key Curve Points:\nX: {}\nY: {}", self.x, self.y)
-    }
-}
-
-#[derive(Debug)]
-pub struct EthereumAddress(pub String);
-
-impl Display for EthereumAddress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Ethereum Address: {}", self.0)
-    }
-}
-
-impl Display for EthereumPrivateKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Ethereum Private Key: {}", self.0)
-    }
-}
-
-#[derive(Debug)]
-pub struct EthereumPrivateKey(pub String);
-
-impl From<&Secret> for EthereumPrivateKey {
-    fn from(value: &Secret) -> Self {
-        let mut hasher = Keccak::v256();
-        let mut pk_buffer = [0u8; 32];
-        hasher.update(&value.0.to_bytes_be().1);
-        hasher.finalize(&mut pk_buffer);
-        EthereumPrivateKey(format!("0x{}", hex::encode(pk_buffer)))
-    }
-}
-
-impl From<&K1CurvePoint> for EthereumAddress {
-    fn from(value: &K1CurvePoint) -> Self {
-        let mut pubkey_buffer: Vec<u8> = Vec::with_capacity(64);
-        pubkey_buffer.extend_from_slice(&value.x.0.to_bytes_be());
-        pubkey_buffer.extend_from_slice(&value.y.0.to_bytes_be());
-        let mut hasher = Keccak::v256();
-        let mut fixed_buffer = [0u8; 32];
-        hasher.update(&pubkey_buffer);
-        hasher.finalize(&mut fixed_buffer);
-        let hashed: &[u8] = &fixed_buffer[12..];
-        EthereumAddress(format!("0x{}", hex::encode(hashed)))
+        write!(
+            f,
+            "Public Key Curve Points:\nX: {}\nY: {}",
+            self.0.x, self.0.y
+        )
     }
 }
 
@@ -129,7 +90,7 @@ pub struct EcDiffieHellman<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct SharedSecret(pub Fp<MontBackend<FqConfig, 4>, 4>);
+pub struct SharedSecret(pub Fq);
 
 impl SharedSecret {
     pub fn as_bigint(&self) -> ark_ff::BigInt<4> {
@@ -140,18 +101,17 @@ impl SharedSecret {
 impl<'a> EcDiffieHellman<'a> {
     pub fn generate_shared_secret(&self) -> SharedSecret {
         // curve point we want to multiply our secret by
-        let q = Affine::new(
-            self.counterparty_public_key.x,
-            self.counterparty_public_key.y,
-        );
-
-        let public_key = q.mul_bigint(&self.secret.0.to_u64_digits().1).into_affine();
+        let q = self.counterparty_public_key;
+        let public_key =
+            q.0.mul_bigint(&self.secret.0.to_u64_digits().1)
+                .into_affine();
         SharedSecret(public_key.x)
     }
 }
 
 #[cfg(test)]
 pub mod test {
+    use ark_ff::BigInteger;
     use chacha20poly1305::{
         aead::{Aead, AeadCore, KeyInit, OsRng},
         ChaCha20Poly1305,
